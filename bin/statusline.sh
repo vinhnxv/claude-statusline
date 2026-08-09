@@ -1,6 +1,18 @@
 #!/bin/bash
 set -f
 
+# Derive config dir: prefer CLAUDE_CONFIG_DIR, then detect from script location
+if [ -n "$CLAUDE_CONFIG_DIR" ]; then
+    claude_config_dir="$CLAUDE_CONFIG_DIR"
+else
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -f "${script_dir}/settings.json" ]; then
+        claude_config_dir="$script_dir"
+    else
+        claude_config_dir="$HOME/.claude"
+    fi
+fi
+
 input=$(cat)
 
 if [ -z "$input" ]; then
@@ -138,10 +150,29 @@ else
 fi
 
 effort="default"
-settings_path="$HOME/.claude/settings.json"
+settings_path="${claude_config_dir}/settings.json"
+custom_api=false
+usage_base_url="$ANTHROPIC_BASE_URL"
+usage_custom_headers="$ANTHROPIC_CUSTOM_HEADERS"
 if [ -f "$settings_path" ]; then
     effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
+    # Detect custom API from settings.json env block
+    settings_auth_token=$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // empty' "$settings_path" 2>/dev/null)
+    [ -z "$usage_base_url" ] && usage_base_url=$(jq -r '.env.ANTHROPIC_BASE_URL // empty' "$settings_path" 2>/dev/null)
+    [ -z "$usage_custom_headers" ] && usage_custom_headers=$(jq -r '.env.ANTHROPIC_CUSTOM_HEADERS // empty' "$settings_path" 2>/dev/null)
+    if [ -n "$settings_auth_token" ]; then
+        custom_api=true
+    fi
 fi
+# Also check environment variables directly. Only a third-party auth token means
+# the usage endpoint is not Anthropic's. A custom base URL is usually a
+# passthrough proxy that still forwards /api/oauth/usage, so the fetch below is
+# redirected through it rather than skipped.
+if [ -n "$ANTHROPIC_AUTH_TOKEN" ]; then
+    custom_api=true
+fi
+usage_base_url="${usage_base_url:-https://api.anthropic.com}"
+usage_base_url="${usage_base_url%/}"
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Thinking ──
 pct_color=$(color_for_pct "$pct_used")
@@ -196,8 +227,26 @@ case "$effort" in
 esac
 
 # ── OAuth token resolution ──────────────────────────────
+get_keychain_service() {
+    # Claude Code uses "Claude Code-credentials-<sha256_prefix>" per config dir
+    # Default ~/.claude uses plain "Claude Code-credentials"
+    local default_dir="$HOME/.claude"
+    if [ "$claude_config_dir" = "$default_dir" ]; then
+        echo "Claude Code-credentials"
+    else
+        local suffix
+        suffix=$(printf '%s' "$claude_config_dir" | shasum -a 256 2>/dev/null | cut -c1-8)
+        if [ -z "$suffix" ]; then
+            suffix=$(printf '%s' "$claude_config_dir" | sha256sum 2>/dev/null | cut -c1-8)
+        fi
+        echo "Claude Code-credentials-${suffix}"
+    fi
+}
+
 get_oauth_token() {
     local token=""
+    local service_name
+    service_name=$(get_keychain_service)
 
     if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
         echo "$CLAUDE_CODE_OAUTH_TOKEN"
@@ -206,7 +255,7 @@ get_oauth_token() {
 
     if command -v security >/dev/null 2>&1; then
         local blob
-        blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+        blob=$(security find-generic-password -s "$service_name" -w 2>/dev/null)
         if [ -n "$blob" ]; then
             token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
             if [ -n "$token" ] && [ "$token" != "null" ]; then
@@ -216,7 +265,7 @@ get_oauth_token() {
         fi
     fi
 
-    local creds_file="${HOME}/.claude/.credentials.json"
+    local creds_file="${claude_config_dir}/.credentials.json"
     if [ -f "$creds_file" ]; then
         token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
         if [ -n "$token" ] && [ "$token" != "null" ]; then
@@ -227,7 +276,7 @@ get_oauth_token() {
 
     if command -v secret-tool >/dev/null 2>&1; then
         local blob
-        blob=$(timeout 2 secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
+        blob=$(timeout 2 secret-tool lookup service "$service_name" 2>/dev/null)
         if [ -n "$blob" ]; then
             token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
             if [ -n "$token" ] && [ "$token" != "null" ]; then
@@ -241,14 +290,17 @@ get_oauth_token() {
 }
 
 # ── Fetch usage data (cached) ──────────────────────────
-cache_file="/tmp/claude/statusline-usage-cache.json"
-cache_max_age=60
+cache_dir_name=$(echo "$claude_config_dir" | sed 's|/|_|g')
+cache_file="/tmp/claude/statusline-usage-cache-${cache_dir_name}.json"
+cache_max_age=300
 mkdir -p /tmp/claude
 
 needs_refresh=true
 usage_data=""
 
-if [ -f "$cache_file" ]; then
+if $custom_api; then
+    needs_refresh=false
+elif [ -f "$cache_file" ]; then
     cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
     now=$(date +%s)
     cache_age=$(( now - cache_mtime ))
@@ -258,19 +310,54 @@ if [ -f "$cache_file" ]; then
     fi
 fi
 
+error_marker="/tmp/claude/statusline-usage-error-${cache_dir_name}"
+
 if $needs_refresh; then
+    # Backoff: if last call errored, wait longer before retrying
+    if [ -f "$error_marker" ]; then
+        err_mtime=$(stat -c %Y "$error_marker" 2>/dev/null || stat -f %m "$error_marker" 2>/dev/null)
+        err_age=$(( $(date +%s) - err_mtime ))
+        if [ "$err_age" -lt 300 ]; then
+            needs_refresh=false
+        else
+            rm -f "$error_marker"
+        fi
+    fi
+fi
+
+if $needs_refresh && ! $custom_api; then
     token=$(get_oauth_token)
     if [ -n "$token" ] && [ "$token" != "null" ]; then
-        response=$(curl -s --max-time 5 \
-            -H "Accept: application/json" \
+        http_code=""
+        header_args=()
+        if [ "$usage_base_url" = "https://api.anthropic.com" ]; then
+            header_args+=(-H "Host: api.anthropic.com")
+        elif [ -n "$usage_custom_headers" ]; then
+            # Claude Code accepts several "Name: Value" pairs, separated by real
+            # newlines or by literal \n. %b turns the latter into the former.
+            while IFS= read -r hdr; do
+                [ -n "${hdr//[[:space:]]/}" ] && header_args+=(-H "$hdr")
+            done < <(printf '%b\n' "$usage_custom_headers")
+        fi
+        response=$(curl -s --compressed --max-time 5 -w "\n%{http_code}" \
+            -H "Accept: application/json, text/plain, */*" \
+            -H "Accept-Encoding: gzip, compress, deflate, br" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $token" \
             -H "anthropic-beta: oauth-2025-04-20" \
-            -H "User-Agent: claude-code/2.1.34" \
-            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+            -H "User-Agent: claude-code/2.1.78" \
+            "${header_args[@]}" \
+            "${usage_base_url}/api/oauth/usage" 2>/dev/null)
+        http_code=$(echo "$response" | tail -1)
+        response=$(echo "$response" | sed '$d')
+
         if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
             usage_data="$response"
             echo "$response" > "$cache_file"
+            rm -f "$error_marker"
+        else
+            # API error — mark to backoff 5 minutes
+            touch "$error_marker"
         fi
     fi
     if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
